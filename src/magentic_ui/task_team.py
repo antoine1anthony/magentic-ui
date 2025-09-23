@@ -89,6 +89,7 @@ async def get_task_team(
             headless=magentic_ui_config.browser_headless,
             local=magentic_ui_config.browser_local
             or magentic_ui_config.run_without_docker,
+            network_name=magentic_ui_config.network_name,
         )
     )
 
@@ -103,6 +104,7 @@ async def get_task_team(
         memory_controller_key=magentic_ui_config.memory_controller_key,
         allow_follow_up_input=magentic_ui_config.allow_follow_up_input,
         final_answer_prompt=magentic_ui_config.final_answer_prompt,
+        sentinel_plan=magentic_ui_config.sentinel_plan,
     )
     websurfer_model_client = magentic_ui_config.model_client_configs.web_surfer
     if websurfer_model_client is None:
@@ -194,7 +196,6 @@ async def get_task_team(
             participants=[web_surfer, user_proxy],
             max_turns=10000,
         )
-        await team.lazy_init()
         return team
     coder_agent: CoderAgent | None = None
     file_surfer: FileSurfer | None = None
@@ -253,5 +254,4 @@ async def get_task_team(
         memory_provider=memory_provider,
     )
 
-    await team.lazy_init()
     return team

@@ -50,6 +50,7 @@ interface ChatViewProps {
   ) => WebSocket | null;
   visible?: boolean;
   onRunStatusChange: (sessionId: number, status: BaseRunStatus) => void;
+  onSubMenuChange: React.Dispatch<React.SetStateAction<string>>;
 }
 
 type PlanUpdateHandler = (plan: IPlanStep[]) => void;
@@ -75,6 +76,7 @@ export default function ChatView({
   getSessionSocket,
   visible = true,
   onRunStatusChange,
+  onSubMenuChange,
 }: ChatViewProps) {
   const serverUrl = getServerUrl();
   const [error, setError] = React.useState<IStatus | null>({
@@ -98,6 +100,10 @@ export default function ChatView({
     React.useState(true);
   const [showDetailViewer, setShowDetailViewer] = React.useState(true);
   const [hasFinalAnswer, setHasFinalAnswer] = React.useState(false);
+  
+  // MCP Server selection state - lifted from ChatInput
+  const [selectedMcpServers, setSelectedMcpServers] = React.useState<string[]>([]);
+
 
   // Context and config
   const [activeSocket, setActiveSocket] = React.useState<WebSocket | null>(
@@ -163,6 +169,17 @@ export default function ChatView({
         // Reset socket
         setActiveSocket(null);
         activeSocketRef.current = null;
+
+        // Restore previously selected MCP servers from session
+        if (session.selected_mcp_configs && session.selected_mcp_configs.length > 0) {
+          // Extract server names from saved configs for UI state
+          const serverNames = session.selected_mcp_configs.map(config => 
+            config.name || config.id
+          ).filter(Boolean);
+          setSelectedMcpServers(serverNames);
+        } else {
+          setSelectedMcpServers([]);
+        }
 
         // Only load data if component is visible
         const latestRun = await loadSessionRun();
@@ -260,15 +277,31 @@ export default function ChatView({
     onRunStatusChange,
   ]);
 
-  // Scroll to bottom when a new message appears or message is updated
+  // Track if user was at bottom before new messages
+  const wasAtBottomRef = React.useRef(true);
+
+  // Check if user is at bottom before messages change
   React.useEffect(() => {
     if (chatContainerRef.current) {
-      chatContainerRef.current.scrollTo({
-        top: chatContainerRef.current.scrollHeight,
+      const container = chatContainerRef.current;
+      const scrollTop = container.scrollTop;
+      const clientHeight = container.clientHeight;
+      const scrollHeight = container.scrollHeight;
+      wasAtBottomRef.current =
+        scrollTop + clientHeight >= scrollHeight - 100 || noMessagesYet;
+    }
+  });
+
+  // Smart scrolling: only scroll to bottom if user was at the bottom before new content
+  React.useEffect(() => {
+    if (chatContainerRef.current && wasAtBottomRef.current) {
+      const container = chatContainerRef.current;
+      container.scrollTo({
+        top: container.scrollHeight,
         behavior: "smooth",
       });
     }
-  }, [currentRun?.messages]);
+  }, [currentRun?.messages, noMessagesYet]);
 
   // Add effect to focus input when session changes
   React.useEffect(() => {
@@ -288,9 +321,7 @@ export default function ChatView({
             // Update the run status even when not visible
             onRunStatusChange(session.id, message.status as BaseRunStatus);
           }
-        } catch (error) {
-          console.error("WebSocket message parsing error:", error);
-        }
+        } catch (error) {}
       };
 
       activeSocket.addEventListener("message", messageHandler);
@@ -304,7 +335,6 @@ export default function ChatView({
   const handleWebSocketMessage = (message: WebSocketMessage) => {
     setCurrentRun((current: Run | null) => {
       if (!current || !session?.id) return null;
-
 
       switch (message.type) {
         case "error":
@@ -424,8 +454,92 @@ export default function ChatView({
     });
   };
 
+  const uploadFiles = async (files: RcFile[], runId: number) => {
+    if (files.length === 0) return [];
+
+    const formData = new FormData();
+    files.forEach((file) => {
+      formData.append("files", file);
+    });
+
+    try {
+      const response = await fetch(`${serverUrl}/runs/${runId}/upload`, {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!response.ok) {
+        throw new Error(`Upload failed: ${response.statusText}`);
+      }
+
+      const result = await response.json();
+      if (!result.status) {
+        throw new Error(result.message || "Upload failed");
+      }
+
+      return result.files || [];
+    } catch (error) {
+      console.error("File upload error:", error);
+      throw error;
+    }
+  };
+
+  const processFiles = async (
+    files: RcFile[],
+    runId: number,
+    errorMessage: string = "File upload failed. Continuing with task..."
+  ) => {
+    let processedFiles: Array<{
+      name: string;
+      content: string;
+      type: string;
+      uploaded?: boolean;
+      path?: string;
+      size?: number;
+    }> = [];
+
+    if (files.length > 0) {
+      try {
+        const uploadedFiles = await uploadFiles(files, runId);
+        // For images, keep the base64 content for immediate display
+        // For other files, use file references
+        processedFiles = await Promise.all(
+          files.map(async (file, index) => {
+            if (file.type.startsWith("image/")) {
+              // For images, convert to base64 for immediate display
+              const base64Files = await convertFilesToBase64([file]);
+              return base64Files[0];
+            } else {
+              // For other files, use file reference
+              const uploadedFile = uploadedFiles[index];
+              return {
+                name: file.name,
+                type: file.type,
+                content: `[FILE_UPLOADED: ${uploadedFile.relative_path}]`,
+                uploaded: true,
+                path: uploadedFile.relative_path,
+                size: uploadedFile.size,
+              };
+            }
+          })
+        );
+      } catch (error) {
+        console.error("File upload failed:", error);
+        message.error(errorMessage);
+        // Fall back to base64 conversion for images only
+        const imageFiles = files.filter((f) => f.type.startsWith("image/"));
+        if (imageFiles.length > 0) {
+          processedFiles = await convertFilesToBase64(imageFiles);
+        }
+      }
+    }
+
+    return processedFiles;
+  };
+
   const handleInputResponse = async (
     response: string,
+    files: RcFile[] = [],
     accepted = false,
     plan?: IPlan
   ) => {
@@ -440,6 +554,13 @@ export default function ChatView({
     }
 
     try {
+      // Upload files first if any are provided
+      const processedFiles = await processFiles(
+        files,
+        Number(currentRun.id),
+        "File upload failed. Continuing with response..."
+      );
+
       // Check if the last message is a plan
       const lastMessage = currentRun.messages.slice(-1)[0];
       var planString = "";
@@ -452,9 +573,17 @@ export default function ChatView({
         planString = convertPlanStepsToJsonString(updatedPlan);
       }
 
+      // Add uploaded file information to the response
+      let enhancedResponse = response;
+      const uploadedFilesList = processedFiles.filter((f) => f.uploaded);
+      if (uploadedFilesList.length > 0) {
+        const filesList = uploadedFilesList.map((f) => f.name).join(", ");
+        enhancedResponse = `Uploaded files: ${filesList}\n\n${response}`;
+      }
+
       const responseJson = {
         accepted: accepted,
-        content: response,
+        content: enhancedResponse,
         ...(planString !== "" && { plan: planString }),
       };
       const responseString = JSON.stringify(responseJson);
@@ -463,6 +592,7 @@ export default function ChatView({
         JSON.stringify({
           type: "input_response",
           response: responseString,
+          files: processedFiles,
         })
       );
 
@@ -590,8 +720,6 @@ export default function ChatView({
     setError(null);
     setNoMessagesYet(false);
 
-    console.log("Running task:", query, files);
-
     try {
       // Make sure run is setup first
       let run = currentRun;
@@ -606,11 +734,83 @@ export default function ChatView({
 
       // Load latest settings from database
       let currentSettings = settingsConfig;
+      let savedMcpConfigs = session?.selected_mcp_configs || [];
+      
       if (user?.email) {
         try {
           currentSettings = (await settingsAPI.getSettings(
             user.email
           )) as GeneralConfig;
+          
+          // Use saved session configs or filter current settings based on selection
+          let mcpConfigsToUse = currentSettings.mcp_agent_configs;
+          
+          if (selectedMcpServers.length > 0) {
+            // Prefer saved session configs if available, otherwise filter current settings
+            if (session?.selected_mcp_configs && session.selected_mcp_configs.length > 0) {
+              mcpConfigsToUse = session.selected_mcp_configs;
+              savedMcpConfigs = session.selected_mcp_configs;
+            } else {
+              // Filter current settings and save to session for future use
+              const selectedConfigs = currentSettings.mcp_agent_configs.filter(config => 
+                selectedMcpServers.includes(config.name || config.id)
+              );
+              
+              mcpConfigsToUse = selectedConfigs;
+              savedMcpConfigs = selectedConfigs;
+              
+              // Save the FULL configs to session
+              if (session?.id) {
+                try {
+                  await sessionAPI.updateSession(session.id, {
+                    selected_mcp_configs: selectedConfigs
+                  }, user.email);
+                  
+                  // Update local session state
+                  onSessionNameChange({
+                    id: session.id,
+                    selected_mcp_configs: selectedConfigs
+                  });
+                } catch (error) {
+                  console.error("Failed to save MCP configs to session:", error);
+                }
+              }
+            }
+            
+            // Use the determined configs
+            currentSettings = {
+              ...currentSettings,
+              mcp_agent_configs: mcpConfigsToUse
+            };
+          } else {
+            // No MCP servers selected - use empty array and save empty state
+            mcpConfigsToUse = [];
+            savedMcpConfigs = [];
+            
+            // Save empty selection to session
+            if (session?.id) {
+              try {
+                await sessionAPI.updateSession(session.id, {
+                  selected_mcp_configs: []
+                }, user.email);
+                
+                // Update local session state
+                onSessionNameChange({
+                  id: session.id,
+                  selected_mcp_configs: []
+                });
+              } catch (error) {
+                console.error("Failed to save empty MCP configs to session:", error);
+              }
+            }
+            
+            // Use empty MCP configs
+            currentSettings = {
+              ...currentSettings,
+              mcp_agent_configs: []
+            };
+          }
+          
           useSettingsStore.getState().updateConfig(currentSettings);
         } catch (error) {
           console.error("Failed to load settings:", error);
@@ -639,14 +839,23 @@ export default function ChatView({
         };
         checkState();
       });
-      console.log("Socket connected");
-      const processedFiles = await convertFilesToBase64(files);
+      // Upload files first, then create file references for non-images
+      const processedFiles = await processFiles(files, Number(run.id));
+
       // Send start message
+
+      // Add uploaded file information to the query
+      let enhancedQuery = query;
+      const uploadedFilesList = processedFiles.filter((f) => f.uploaded);
+      if (uploadedFilesList.length > 0) {
+        const filesList = uploadedFilesList.map((f) => f.name).join(", ");
+        enhancedQuery = `Uploaded files: ${filesList}\n\n${query}`;
+      }
 
       var planString = plan ? convertPlanStepsToJsonString(plan.steps) : "";
 
       const taskJson = {
-        content: query,
+        content: enhancedQuery,
         ...(planString !== "" && { plan: planString }),
       };
 
@@ -662,6 +871,7 @@ export default function ChatView({
       const sessionData = {
         id: session?.id,
         name: query.slice(0, 50),
+        selected_mcp_configs: savedMcpConfigs,
       };
       onSessionNameChange(sessionData);
     } catch (error) {
@@ -713,7 +923,6 @@ export default function ChatView({
     setActiveSocket(socket);
     // set up socket ref
     activeSocketRef.current = socket;
-    console.log("Socket setup complete");
     return socket;
   };
 
@@ -753,7 +962,6 @@ export default function ChatView({
           : setupWebSocket(currentRun.id, true, false);
 
       if (!socket || socket.readyState !== WebSocket.OPEN) {
-        console.error("WebSocket not available or not open");
         return;
       }
 
@@ -929,20 +1137,20 @@ export default function ChatView({
   // Add these handlers before the return statement
   const handleApprove = () => {
     if (currentRun?.status === "awaiting_input") {
-      handleInputResponse("approve", true);
+      handleInputResponse("approve", [], true);
     }
   };
 
   const handleDeny = () => {
     if (currentRun?.status === "awaiting_input") {
-      handleInputResponse("deny", false);
+      handleInputResponse("deny", [], false);
     }
   };
 
   const handleAcceptPlan = (text: string) => {
     if (currentRun?.status === "awaiting_input") {
       const query = text || "Plan Accepted";
-      handleInputResponse(query, true);
+      handleInputResponse(query, [], true);
     }
   };
 
@@ -1016,7 +1224,10 @@ export default function ChatView({
                     error={error}
                     chatInputRef={chatInputRef}
                     onExecutePlan={handleExecutePlan}
-                    enable_upload={false} // Or true if needed
+                    enable_upload={true} // Or true if needed
+                    selectedMcpServers={selectedMcpServers}
+                    onSelectedMcpServersChange={setSelectedMcpServers}
+                    onSubMenuChange={onSubMenuChange}
                   />
                 )}
               </>
@@ -1049,7 +1260,7 @@ export default function ChatView({
                       currentRun?.status === "awaiting_input" ||
                       currentRun?.status === "paused"
                     ) {
-                      handleInputResponse(query, accepted, plan);
+                      handleInputResponse(query, files, accepted, plan);
                     } else {
                       runTask(query, files, plan, true);
                     }
@@ -1062,6 +1273,12 @@ export default function ChatView({
                   onPause={handlePause}
                   enable_upload={true}
                   onExecutePlan={handleExecutePlan}
+                  onSubMenuChange={onSubMenuChange}
+                  mcpSelectorDisabled={
+                    currentRun?.status === "awaiting_input" ||
+                    currentRun?.status === "paused"}
+                  selectedMcpServers={selectedMcpServers}
+                  onSelectedMcpServersChange={setSelectedMcpServers}
                 />
               </div>
               <SampleTasks

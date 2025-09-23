@@ -325,6 +325,9 @@ const RenderPlan: React.FC<RenderPlanProps> = memo(
       enabled: step.enabled !== false,
       open: step.open || false,
       agent_name: step.agent_name || "",
+      // Include sentinel fields if present
+      ...(step.sleep_duration !== undefined && { sleep_duration: step.sleep_duration }),
+      ...(step.condition !== undefined && { condition: step.condition }),
     }));
 
     const [planSteps, setPlanSteps] = useState<IPlanStep[]>(initialPlanSteps);
@@ -474,7 +477,6 @@ const RenderFinalAnswer: React.FC<RenderFinalAnswerProps> = memo(
             sessionId={sessionId}
             messageId={messageIdx}
             onSuccess={(planId: string) => {
-              console.log("Plan created with ID:", planId);
             }}
           />
         </div>
@@ -565,7 +567,6 @@ export const messageUtils = {
 
       return "";
     } catch (error) {
-      console.error("Failed to update plan:", error);
       return "";
     }
   },
@@ -585,7 +586,6 @@ const RenderUserMessage: React.FC<{
       try {
         return JSON.parse(parsedContent.metadata.attached_files);
       } catch (e) {
-        console.error("Failed to parse attached_files:", e);
         return [];
       }
     }
@@ -683,7 +683,6 @@ export const RenderMessage: React.FC<MessageProps> = memo(
         ? parseUserContent(message)
         : { text: message.content, metadata: message.metadata };
 
-      console.log(message.metadata)
 
     // Use new plan message check
     const isPlanMsg = messageUtils.isPlanMessage(message.metadata);

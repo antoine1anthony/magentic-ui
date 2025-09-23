@@ -25,7 +25,7 @@ interface RunViewProps {
   onDeny?: () => void;
   onAcceptPlan?: (text: string) => void;
   // Add new props needed for ChatInput
-  onInputResponse?: (query: string, accepted?: boolean, plan?: IPlan) => void;
+  onInputResponse?: (query: string, files: RcFile[], accepted?: boolean, plan?: IPlan) => void;
   onRunTask?: (
     query: string,
     files: RcFile[],
@@ -37,6 +37,9 @@ interface RunViewProps {
   chatInputRef?: React.RefObject<any>;
   onExecutePlan?: (plan: IPlan) => void;
   enable_upload?: boolean;
+  onSubMenuChange: React.Dispatch<React.SetStateAction<string>>;
+  selectedMcpServers: string[];
+  onSelectedMcpServersChange: (servers: string[]) => void;
 }
 
 const RunView: React.FC<RunViewProps> = ({
@@ -59,6 +62,9 @@ const RunView: React.FC<RunViewProps> = ({
   chatInputRef,
   onExecutePlan,
   enable_upload = false,
+  onSubMenuChange,
+  selectedMcpServers,
+  onSelectedMcpServersChange,
 }) => {
   const threadContainerRef = useRef<HTMLDivElement | null>(null);
   const [novncPort, setNovncPort] = useState<string | undefined>();
@@ -93,9 +99,23 @@ const RunView: React.FC<RunViewProps> = ({
   // Add this with other refs near the top of the component
   const buttonsContainerRef = useRef<HTMLDivElement | null>(null);
 
-  // Combine scroll behavior when messages or status change
+  // Track if user was at bottom before new messages
+  const wasAtBottomRef = useRef(true);
+  
+  // Check if user is at bottom before messages change
   useEffect(() => {
-    if (run.messages.length > 0 && threadContainerRef.current) {
+    if (threadContainerRef.current) {
+      const container = threadContainerRef.current;
+      const scrollTop = container.scrollTop;
+      const clientHeight = container.clientHeight;
+      const scrollHeight = container.scrollHeight;
+      wasAtBottomRef.current = scrollTop + clientHeight >= scrollHeight - 100 || run.messages.length === 0;
+    }
+  });
+
+  // Smart scrolling: only scroll to bottom if user was at the bottom before new content
+  useEffect(() => {
+    if (run.messages.length > 0 && threadContainerRef.current && wasAtBottomRef.current) {
       // Use a small delay to ensure the DOM has updated
       setTimeout(() => {
         const container = threadContainerRef.current;
@@ -113,7 +133,6 @@ const RunView: React.FC<RunViewProps> = ({
     );
     const lastBrowserAddressMsg =
       browserAddressMessages[browserAddressMessages.length - 1];
-    console.log("Last browserAddressMsg", lastBrowserAddressMsg);
     // only update if novncPort is it is different from the current novncPort
     if (
       lastBrowserAddressMsg &&
@@ -164,7 +183,7 @@ const RunView: React.FC<RunViewProps> = ({
         Array.isArray(msg.config.content) &&
         msg.config.metadata?.type === "browser_screenshot"
       ) {
-        msg.config.content.forEach((item: any, itemIndex: number) => {
+        msg.config.content.forEach((item: any) => {
           if (typeof item === "object" && ("url" in item || "data" in item)) {
             const imageUrl =
               ("url" in item && item.url) ||
@@ -219,9 +238,6 @@ const RunView: React.FC<RunViewProps> = ({
   const handleToggleHide = async (messageIndex: number, expanded: boolean) => {
     // If a toggle operation is already in progress, ignore this request
     if (isTogglingRef.current) {
-      console.log(
-        "Something bad: Toggle operation already in progress, ignoring request"
-      );
       return;
     }
 
@@ -419,7 +435,6 @@ const RunView: React.FC<RunViewProps> = ({
             }
             continue;
           }
-          const content = JSON.parse(msg.config.content);
 
           // If this is a step execution that's not repeated
           if (
@@ -534,15 +549,23 @@ const RunView: React.FC<RunViewProps> = ({
   const isPlanMsg =
     lastMessage && messageUtils.isPlanMessage(lastMessage.config.metadata);
 
-  // Add this effect to handle scrolling when status changes
+  // Smart scrolling for approval buttons: only scroll if user is near the bottom
   useEffect(() => {
-    if (run.status === "awaiting_input" && buttonsContainerRef.current) {
+    if (run.status === "awaiting_input" && buttonsContainerRef.current && threadContainerRef.current) {
       // Use a small delay to ensure the DOM has updated
       setTimeout(() => {
-        buttonsContainerRef.current?.scrollIntoView({
-          behavior: "smooth",
-          block: "nearest",
-        });
+        const container = threadContainerRef.current;
+        if (container) {
+          const isNearBottom = container.scrollTop + container.clientHeight >= container.scrollHeight - 100; // 100px threshold
+          
+          // Only scroll to approval buttons if user is near the bottom
+          if (isNearBottom) {
+            buttonsContainerRef.current?.scrollIntoView({
+              behavior: "smooth",
+              block: "nearest",
+            });
+          }
+        }
       }, 100);
     }
   }, [run.status]);
@@ -659,7 +682,7 @@ const RunView: React.FC<RunViewProps> = ({
               plan?: IPlan
             ) => {
               if (run.status === "awaiting_input" || run.status === "paused") {
-                onInputResponse?.(query, accepted, plan);
+                onInputResponse?.(query, files, accepted, plan);
               } else {
                 onRunTask?.(query, files, plan, true);
               }
@@ -672,6 +695,12 @@ const RunView: React.FC<RunViewProps> = ({
             enable_upload={enable_upload}
             inputRequest={run.input_request}
             onExecutePlan={onExecutePlan}
+            onSubMenuChange={onSubMenuChange}
+            mcpSelectorDisabled={
+              run.status === "awaiting_input" ||
+              run.status === "paused"}
+            selectedMcpServers={selectedMcpServers}
+            onSelectedMcpServersChange={onSelectedMcpServersChange}
           />
         </div>
       </div>

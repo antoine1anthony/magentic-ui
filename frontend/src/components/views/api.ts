@@ -443,9 +443,46 @@ export class SettingsAPI {
     if (!data.status)
       throw new Error(data.message || "Failed to update settings");
   }
+
+  async getConfigInfo(): Promise<{ has_config_file: boolean; config_file_path: string | null; config_content: any }> {
+    const response = await fetch(
+      `${this.getBaseUrl()}/settings/config-info`,
+      {
+        headers: this.getHeaders(),
+      }
+    );
+    const data = await response.json();
+    if (!data.status)
+      throw new Error(data.message || "Failed to fetch config info");
+    return data.data;
+  }
+}
+
+export class McpAPI {
+  private getBaseUrl(): string {
+    return getServerUrl();
+  }
+
+  private getHeaders(): HeadersInit {
+    return {
+      "Content-Type": "application/json",
+    };
+  }
+
+  async testMcpServer(serverConfig: any): Promise<any> {
+    const response = await fetch(`${this.getBaseUrl()}/mcp/test-mcp-server`, {
+      method: "POST",
+      headers: this.getHeaders(),
+      body: JSON.stringify({ server_config: serverConfig }),
+    });
+    const data = await response.json();
+    // The MCP endpoint returns the response directly without status/data wrapper
+    return data;
+  }
 }
 
 export const teamAPI = new TeamAPI();
 export const sessionAPI = new SessionAPI();
 export const planAPI = new PlanAPI();
 export const settingsAPI = new SettingsAPI();
+export const mcpAPI = new McpAPI();

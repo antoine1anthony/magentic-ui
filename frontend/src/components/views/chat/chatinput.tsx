@@ -17,25 +17,22 @@ import {
   Menu,
 } from "antd";
 import type { UploadFile, UploadProps, RcFile } from "antd/es/upload/interface";
-import { FileTextIcon, ImageIcon, XIcon, UploadIcon } from "lucide-react";
+import {
+  FileTextIcon,
+  ImageIcon,
+  XIcon,
+  UploadIcon,
+  PaperclipIcon,
+} from "lucide-react";
 import { InputRequest } from "../../types/datamodel";
 import { debounce } from "lodash";
-import { planAPI } from "../api";
+import { planAPI, settingsAPI } from "../api";
 import RelevantPlans from "./relevant_plans";
 import { IPlan } from "../../types/plan";
 import PlanView from "./plan";
-
-// Maximum file size in bytes (5MB)
-const MAX_FILE_SIZE = 5 * 1024 * 1024;
-// Allowed file types
-const ALLOWED_FILE_TYPES = [
-  "text/plain",
-  "image/jpeg",
-  "image/png",
-  "image/gif",
-  "image/svg+xml",
-];
-
+import { McpServerSelector } from "../../features/McpServerSelector/McpServerSelector";
+import { MCPAgentConfig, MCPServerInfo } from "../../features/McpServersConfig/types";
+import { extractMcpServers } from "../../features/McpServersConfig/McpServersList";
 // Threshold for large text files (in characters)
 const LARGE_TEXT_THRESHOLD = 1500;
 
@@ -55,6 +52,10 @@ interface ChatInputProps {
   onPause?: () => void;
   enable_upload?: boolean;
   onExecutePlan?: (plan: IPlan) => void;
+  onSubMenuChange: React.Dispatch<React.SetStateAction<string>>;
+  mcpSelectorDisabled: boolean;
+  selectedMcpServers: string[];
+  onSelectedMcpServersChange: (servers: string[]) => void;
 }
 
 const ChatInput = React.forwardRef<{ focus: () => void }, ChatInputProps>(
@@ -70,6 +71,10 @@ const ChatInput = React.forwardRef<{ focus: () => void }, ChatInputProps>(
       onPause,
       enable_upload = false,
       onExecutePlan,
+      onSubMenuChange,
+      mcpSelectorDisabled,
+      selectedMcpServers,
+      onSelectedMcpServersChange
     },
     ref
   ) => {
@@ -99,7 +104,7 @@ const ChatInput = React.forwardRef<{ focus: () => void }, ChatInputProps>(
       runStatus === "active" ||
       runStatus === "pausing" ||
       inputRequest?.input_type === "approval";
-
+    const [mcpServers, setMcpServers] = React.useState<MCPServerInfo[]>([]);
     // Handle textarea auto-resize
     React.useEffect(() => {
       if (textAreaRef.current) {
@@ -148,9 +153,31 @@ const ChatInput = React.forwardRef<{ focus: () => void }, ChatInputProps>(
           setIsLoading(false);
         }
       };
+      const fetchMCPServers = async () => {
+        if (!user?.email) {
+          console.error("User not authenticated");
+          setIsLoading(false);
+          return;
+        }
 
+        try {
+          setIsLoading(true);
+
+          // Get user's latest settings from database
+          const settings = await settingsAPI.getSettings(user.email);
+          const mcpAgentConfigs: MCPAgentConfig[] = settings.mcp_agent_configs || [];
+          const mcpServers = extractMcpServers(mcpAgentConfigs);
+          setMcpServers(mcpServers);
+        } catch (err) {
+          console.error("Failed to fetch MCP servers:", err);
+        } finally {
+          setIsLoading(false);
+        }
+      };
+
+      fetchMCPServers();
       fetchAllPlans();
-    }, [userId]);
+    }, [userId, user?.email]);
 
     // Add paste event listener for images and large text
     const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
@@ -168,7 +195,7 @@ const ChatInput = React.forwardRef<{ focus: () => void }, ChatInputProps>(
             hasImageItem = true;
             const file = item.getAsFile();
 
-            if (file && file.size <= MAX_FILE_SIZE) {
+            if (file) {
               // Prevent the default paste behavior for images
               e.preventDefault();
 
@@ -194,9 +221,7 @@ const ChatInput = React.forwardRef<{ focus: () => void }, ChatInputProps>(
               setFileList((prev) => [...prev, uploadFile]);
 
               // Show successful paste notification
-              message.success(`Image pasted successfully`);
-            } else if (file && file.size > MAX_FILE_SIZE) {
-              message.error(`Pasted image is too large. Maximum size is 5MB.`);
+              message.success(`File pasted successfully`);
             }
           }
 
@@ -301,8 +326,6 @@ const ChatInput = React.forwardRef<{ focus: () => void }, ChatInputProps>(
 
     const searchPlans = React.useCallback(
       debounce((query: string) => {
-        console.log("Search request with query:", query);
-
         // Don't search if query is too short, no plans available, or plan is already attached
         if (
           query.length < 3 ||
@@ -349,7 +372,6 @@ const ChatInput = React.forwardRef<{ focus: () => void }, ChatInputProps>(
             setIsRelevantPlansVisible(false);
           }
         } catch (error) {
-          console.error("Error searching plans:", error);
         } finally {
           setIsSearching(false);
         }
@@ -432,30 +454,9 @@ const ChatInput = React.forwardRef<{ focus: () => void }, ChatInputProps>(
       },
     }));
 
-    // Add helper function for file validation and addition
-    const handleFileValidationAndAdd = (file: File): boolean => {
-      // Check file size
-      if (file.size > MAX_FILE_SIZE) {
-        message.error(`${file.name} is too large. Maximum size is 5MB.`);
-        return false;
-      }
-
-      // Check file type
-      if (!ALLOWED_FILE_TYPES.includes(file.type)) {
-        notificationApi.warning({
-          message: <span className="text-sm">Unsupported File Type</span>,
-          description: (
-            <span className="text-sm text-secondary">
-              Please upload only text (.txt) or images (.jpg, .png, .gif, .svg)
-              files.
-            </span>
-          ),
-          duration: 8.5,
-        });
-        return false;
-      }
-
-      // Add valid file to fileList
+    // Add helper function for file addition
+    const handleFileAdd = (file: File): boolean => {
+      // Add file to fileList
       const uploadFile: UploadFile = {
         uid: `file-${Date.now()}-${file.name}`,
         name: file.name,
@@ -475,10 +476,8 @@ const ChatInput = React.forwardRef<{ focus: () => void }, ChatInputProps>(
       multiple: true,
       fileList,
       beforeUpload: (file: RcFile) => {
-        if (handleFileValidationAndAdd(file)) {
-          return false; // Prevent automatic upload
-        }
-        return Upload.LIST_IGNORE;
+        handleFileAdd(file);
+        return false; // Prevent automatic upload
       },
       onRemove: (file: UploadFile) => {
         setFileList(fileList.filter((item) => item.uid !== file.uid));
@@ -494,10 +493,30 @@ const ChatInput = React.forwardRef<{ focus: () => void }, ChatInputProps>(
 
     const getFileIcon = (file: UploadFile) => {
       const fileType = file.type || "";
+      const fileName = file.name || "";
+
       if (fileType.startsWith("image/")) {
         return <ImageIcon className="w-4 h-4" />;
       }
-      return <FileTextIcon className="w-4 h-4" />;
+
+      // Check for specific file types based on extension
+      const extension = fileName.split(".").pop()?.toLowerCase();
+      switch (extension) {
+        case "pdf":
+          return <FileTextIcon className="w-4 h-4 text-red-500" />;
+        case "doc":
+        case "docx":
+          return <FileTextIcon className="w-4 h-4 text-blue-500" />;
+        case "xls":
+        case "xlsx":
+          return <FileTextIcon className="w-4 h-4 text-green-500" />;
+        case "zip":
+        case "rar":
+        case "7z":
+          return <FileTextIcon className="w-4 h-4 text-yellow-500" />;
+        default:
+          return <FileTextIcon className="w-4 h-4" />;
+      }
     };
 
     // Add drag and drop handlers
@@ -524,7 +543,7 @@ const ChatInput = React.forwardRef<{ focus: () => void }, ChatInputProps>(
       if (isInputDisabled || !enable_upload) return;
 
       const droppedFiles = Array.from(e.dataTransfer.files);
-      droppedFiles.forEach(handleFileValidationAndAdd);
+      droppedFiles.forEach(handleFileAdd);
     };
 
     const handleUsePlan = (plan: IPlan) => {
@@ -581,6 +600,15 @@ const ChatInput = React.forwardRef<{ focus: () => void }, ChatInputProps>(
       };
     }, [isRelevantPlansVisible]);
 
+    const goToMcpServersTab = React.useCallback(() => {
+      onSubMenuChange("mcp_servers");
+    }, [onSubMenuChange]);
+
+    const handleMcpServerSelectionChange = React.useCallback((newSelection: string[]) => {
+      onSelectedMcpServersChange(newSelection);
+    }, [onSelectedMcpServersChange]);
+
+
     return (
       <div className="mt-2 w-full relative">
         {notificationContextHolder}
@@ -595,21 +623,52 @@ const ChatInput = React.forwardRef<{ focus: () => void }, ChatInputProps>(
           />
         )}
 
+        {/* Selected MCP Tools Display */}
+        {selectedMcpServers.length > 0 && (
+          <div
+            className={`-mb-2 mx-1 ${darkMode === "dark" ? "bg-[#333333]" : "bg-gray-100"
+              } rounded-t border-b-0 p-2 flex border flex-wrap gap-2`}
+          >
+            {selectedMcpServers.map((serverName) => (
+              <div
+                key={serverName}
+                className={`flex items-center gap-1 ${darkMode === "dark"
+                  ? "bg-[#444444] text-white"
+                  : "bg-white text-black"
+                  } rounded px-2 py-1 text-xs`}
+              >
+                <span className="truncate max-w-[150px]">🔧 {serverName}</span>
+                {runStatus === "created" && (
+                  <Button
+                    type="text"
+                    size="small"
+                    className="p-0 ml-1 flex items-center justify-center"
+                    onClick={() =>
+                      onSelectedMcpServersChange(
+                        selectedMcpServers.filter((s) => s !== serverName)
+                      )
+                    }
+                    icon={<XIcon className="w-3 h-3" />}
+                  />
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
         {/* Attached Items Preview */}
         {(attachedPlan || fileList.length > 0) && (
           <div
-            className={`-mb-2 mx-1 ${
-              darkMode === "dark" ? "bg-[#333333]" : "bg-gray-100"
-            } rounded-t border-b-0 p-2 flex border flex-wrap gap-2`}
+            className={`${selectedMcpServers.length > 0 ? '-mt-2' : '-mb-2'} mx-1 ${darkMode === "dark" ? "bg-[#333333]" : "bg-gray-100"
+              } ${selectedMcpServers.length > 0 ? 'rounded-b border-t-0' : 'rounded-t border-b-0'} p-2 flex border flex-wrap gap-2`}
           >
             {/* Attached Plan */}
             {attachedPlan && (
               <div
-                className={`flex items-center gap-1 ${
-                  darkMode === "dark"
-                    ? "bg-[#444444] text-white"
-                    : "bg-white text-black"
-                } rounded px-2 py-1 text-xs cursor-pointer hover:opacity-80 transition-opacity`}
+                className={`flex items-center gap-1 ${darkMode === "dark"
+                  ? "bg-[#444444] text-white"
+                  : "bg-white text-black"
+                  } rounded px-2 py-1 text-xs cursor-pointer hover:opacity-80 transition-opacity`}
                 onClick={handlePlanClick}
               >
                 <span className="truncate max-w-[150px]">
@@ -632,11 +691,10 @@ const ChatInput = React.forwardRef<{ focus: () => void }, ChatInputProps>(
             {fileList.map((file) => (
               <div
                 key={file.uid}
-                className={`flex items-center gap-1 ${
-                  darkMode === "dark"
-                    ? "bg-[#444444] text-white"
-                    : "bg-white text-black"
-                } rounded px-2 py-1 text-xs`}
+                className={`flex items-center gap-1 ${darkMode === "dark"
+                  ? "bg-[#444444] text-white"
+                  : "bg-white text-black"
+                  } rounded px-2 py-1 text-xs`}
               >
                 {getFileIcon(file)}
                 <span className="truncate max-w-[150px]">{file.name}</span>
@@ -670,7 +728,7 @@ const ChatInput = React.forwardRef<{ focus: () => void }, ChatInputProps>(
               task={attachedPlan.task || ""}
               plan={attachedPlan.steps || []}
               viewOnly={true}
-              setPlan={() => {}}
+              setPlan={() => { }}
             />
           )}
         </Modal>
@@ -698,13 +756,11 @@ const ChatInput = React.forwardRef<{ focus: () => void }, ChatInputProps>(
                     defaultValue={""}
                     onChange={handleTextChange}
                     onKeyDown={handleKeyDown}
-                    className={`flex items-center w-full resize-none border-l border-t border-b border-accent p-2 pl-5 rounded-l-lg ${
-                      darkMode === "dark"
-                        ? "bg-[#444444] text-white"
-                        : "bg-white text-black"
-                    } ${
-                      isInputDisabled ? "cursor-not-allowed" : ""
-                    } focus:outline-none`}
+                    className={`flex items-center w-full resize-none border-l border-t border-b border-accent p-2 pl-5 rounded-l-lg ${darkMode === "dark"
+                      ? "bg-[#444444] text-white"
+                      : "bg-white text-black"
+                      } ${isInputDisabled ? "cursor-not-allowed" : ""
+                      } focus:outline-none`}
                     style={{
                       maxHeight: "120px",
                       overflowY: "auto",
@@ -714,10 +770,10 @@ const ChatInput = React.forwardRef<{ focus: () => void }, ChatInputProps>(
                       runStatus === "awaiting_input"
                         ? "Type your response here and let Magentic-UI know of any changes in the browser."
                         : enable_upload
-                        ? dragOver
-                          ? "Drop files here..."
+                          ? dragOver
+                            ? "Drop files here..."
+                            : "Type your message here..."
                           : "Type your message here..."
-                        : "Type your message here..."
                     }
                     disabled={isInputDisabled}
                   />
@@ -725,27 +781,43 @@ const ChatInput = React.forwardRef<{ focus: () => void }, ChatInputProps>(
               </div>
 
               <div
-                className={`flex items-center justify-center gap-2 border-t border-r border-b border-accent px-2 rounded-r-lg ${
-                  darkMode === "dark"
-                    ? "bg-[#444444] text-white"
-                    : "bg-white text-black"
-                }`}
+                className={`flex items-center justify-center gap-2 border-t border-r border-b border-accent px-2 rounded-r-lg ${darkMode === "dark"
+                  ? "bg-[#444444] text-white"
+                  : "bg-white text-black"
+                  }`}
               >
+
+                {runStatus === "created" && (
+                  <McpServerSelector
+                    servers={mcpServers}
+                    onAddMcpServer={goToMcpServersTab}
+                    runStatus={runStatus}
+                    value={selectedMcpServers}
+                    onChange={handleMcpServerSelectionChange}
+                  />
+                )}
+
                 {/* File upload button replaced with Dropdown */}
                 {enable_upload && (
                   <div
-                    className={`$${
-                      isInputDisabled ? "pointer-events-none opacity-50" : ""
-                    }`}
+                    className={`${isInputDisabled ? "pointer-events-none opacity-50" : ""
+                      }`}
                   >
                     <Dropdown
                       overlay={
                         <Menu>
-                          <Menu.Item key="attach-file">
+                          <Menu.Item
+                            key="attach-file"
+                            className="!py-0 !my-0 !h-8"
+                          >
                             <Upload {...uploadProps} showUploadList={false}>
-                              <span>Attach File</span>
+                              <span className="flex items-center gap-2">
+                                <PaperclipIcon className="w-4 h-4" />
+                                Attach File
+                              </span>
                             </Upload>
                           </Menu.Item>
+                          <Menu.Divider />
                           <Menu.SubMenu key="attach-plan" title="Attach Plan">
                             {allPlans.length === 0 ? (
                               <Menu.Item disabled key="no-plans">
@@ -798,11 +870,10 @@ const ChatInput = React.forwardRef<{ focus: () => void }, ChatInputProps>(
                     type="button"
                     onClick={handleSubmit}
                     disabled={isInputDisabled}
-                    className={`bg-magenta-800 transition duration-300 rounded flex justify-center items-center w-11 h-9 ${
-                      isInputDisabled
-                        ? "cursor-not-allowed"
-                        : "hover:bg-magenta-900"
-                    }`}
+                    className={`bg-magenta-800 transition duration-300 rounded flex justify-center items-center w-11 h-9 ${isInputDisabled
+                      ? "cursor-not-allowed"
+                      : "hover:bg-magenta-900"
+                      }`}
                   >
                     <PaperAirplaneIcon className="h-6 w-6 text-white" />
                   </button>

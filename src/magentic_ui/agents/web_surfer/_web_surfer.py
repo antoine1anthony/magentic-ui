@@ -80,8 +80,8 @@ from ._tool_definitions import (
     TOOL_CLICK,
     TOOL_HISTORY_BACK,
     TOOL_HOVER,
-    TOOL_PAGE_DOWN,
-    TOOL_PAGE_UP,
+    # TOOL_PAGE_DOWN,
+    # TOOL_PAGE_UP,
     TOOL_READ_PAGE_AND_ANSWER,
     TOOL_SLEEP,
     TOOL_TYPE,
@@ -91,9 +91,11 @@ from ._tool_definitions import (
     TOOL_SELECT_OPTION,
     TOOL_CREATE_TAB,
     TOOL_SWITCH_TAB,
-    TOOL_CLOSE_TAB,
+    # TOOL_CLOSE_TAB,
     TOOL_KEYPRESS,
     TOOL_REFRESH_PAGE,
+    TOOL_SCROLL_DOWN,
+    TOOL_SCROLL_UP,
     # TOOL_UPLOAD_FILE,
     # TOOL_CLICK_FULL,
 )
@@ -137,6 +139,7 @@ class WebSurferConfig(BaseModel):
     viewport_height: int = 1440
     viewport_width: int = 1440
     use_action_guard: bool = False
+    search_engine: str = "duckduckgo"
 
 
 class WebSurferState(BaseState):
@@ -194,6 +197,7 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
         multiple_tools_per_call (bool, optional): Whether to allow execution of multiple tool calls sequentially per model call. Default: False.
         viewport_height (int, optional): The height of the viewport. Default: 1440.
         viewport_width (int, optional): The width of the viewport. Default: 1440.
+        search_engine (str, optional): The search engine to use for web searches. Supported engines: "duckduckgo", "google", "bing", "yahoo". Any other value will be treated as a direct website URL to visit. Default: "duckduckgo".
     """
 
     component_type = "agent"
@@ -207,7 +211,7 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
     In a single step when you ask the agent to do something, it will perform multiple actions sequentially until it decides to stop.
     The actions it can perform are:
     - visiting a web page url
-    - performing a web search using Bing
+    - performing a web search using a configurable search engine
     - Interact with a web page: clicking a button, hovering over a button, typing in a field, scrolling the page, select an option in a dropdown
     - Downloading a file from the web page and upload file from the local file system
     - Pressing a key on the keyboard to interact with the web page
@@ -250,6 +254,7 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
         viewport_height: int = 1440,
         viewport_width: int = 1440,
         use_action_guard: bool = False,
+        search_engine: str = "duckduckgo",
     ) -> None:
         """
         Initialize the WebSurfer.
@@ -280,6 +285,7 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
         self.viewport_height = viewport_height
         self.viewport_width = viewport_width
         self.use_action_guard = use_action_guard
+        self.search_engine = search_engine
         self._browser = browser
         # Call init to set these in case not set
         self._context: BrowserContext | None = None
@@ -346,9 +352,12 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
             TOOL_HISTORY_BACK,
             TOOL_KEYPRESS,
             TOOL_REFRESH_PAGE,
+            TOOL_SCROLL_DOWN,
+            TOOL_SCROLL_UP,
             # TOOL_CLICK_FULL,
         ]
         self.did_lazy_init = False  # flag to check if we have initialized the browser
+        self._browser_just_initialized = False
         self.is_paused = False
         self._pause_event = asyncio.Event()
         self.action_guard: BaseApprovalGuard | None = (
@@ -358,6 +367,37 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
             self.is_multimodal = True
         else:
             self.is_multimodal = False
+
+    def _get_search_url(self, query: str) -> tuple[str, str]:
+        """Get search URL and domain based on configured search engine.
+
+        Args:
+            query (str): The search query
+
+        Returns:
+            tuple[str, str]: (search_url, domain) - For known search engines, returns search URL.
+                            For unknown engines, treats the engine name as a direct website URL.
+        """
+        if self.search_engine.lower() == "google":
+            domain = "google.com"
+            url = f"https://www.google.com/search?q={quote_plus(query)}"
+        elif self.search_engine.lower() == "bing":
+            domain = "bing.com"
+            url = f"https://www.bing.com/search?q={quote_plus(query)}"
+        elif self.search_engine.lower() == "yahoo":
+            domain = "yahoo.com"
+            url = f"https://search.yahoo.com/search?p={quote_plus(query)}"
+        elif self.search_engine.lower() == "duckduckgo":
+            domain = "duckduckgo.com"
+            url = f"https://duckduckgo.com/?q={quote_plus(query)}"
+        else:  # treat as direct website URL
+            domain = self.search_engine
+            url = (
+                f"https://{self.search_engine}"
+                if not self.search_engine.startswith(("http://", "https://"))
+                else self.search_engine
+            )
+        return url, domain
 
     async def lazy_init(
         self,
@@ -415,6 +455,7 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
         # Prepare the debug directory -- which stores the screenshots generated throughout the process
         await self._set_debug_dir()
         self.did_lazy_init = True
+        self._browser_just_initialized = True
 
     async def pause(self) -> None:
         """Pause the WebSurfer agent."""
@@ -504,6 +545,30 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
             AsyncGenerator: A stream of `BaseChatMessage` or `Response` objects.
         """
         # only keep last message and any MultiModalMessages
+        await self.lazy_init()
+
+        # Ensure page is ready after lazy initialization
+        assert self._page is not None, "Page should be initialized"
+
+        # Send browser address message if this is the first time the browser is being used
+        if (
+            self._browser_just_initialized
+            and isinstance(self._browser, VncDockerPlaywrightBrowser)
+            and self._browser.novnc_port > 0
+        ):
+            # Send browser address message after browser is initialized
+            yield TextMessage(
+                source="system",
+                content=f"Browser noVNC address can be found at http://localhost:{self._browser.novnc_port}/vnc.html",
+                metadata={
+                    "internal": "no",
+                    "type": "browser_address",
+                    "novnc_port": str(self._browser.novnc_port),
+                    "playwright_port": str(self._browser.playwright_port),
+                },
+            )
+            # Reset the flag so we don't send the message again
+            self._browser_just_initialized = False
         for i, chat_message in enumerate(messages):
             if isinstance(chat_message, MultiModalMessage):
                 self._chat_history.append(
@@ -535,9 +600,6 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
                 )
             )
         non_action_tools = ["stop_action", "answer_question"]
-        # first make sure the page is accessible
-
-        assert self._page is not None
 
         # Set up the cancellation token for the code execution.
         llm_cancellation_token = CancellationToken()
@@ -564,6 +626,7 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
                 ) = await self._get_llm_response(
                     cancellation_token=llm_cancellation_token
                 )
+
                 final_usage = RequestUsage(
                     prompt_tokens=sum([u.prompt_tokens for u in self.model_usage]),
                     completion_tokens=sum(
@@ -877,6 +940,8 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
             )
         )
         try:
+            # Ensure page is ready for final response
+            assert self._page is not None, "Page should be initialized"
             (
                 message_content,
                 maybe_new_screenshot,
@@ -949,13 +1014,9 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
                 - Dict[str, str]: Mapping of element IDs
                 - bool: Boolean indicating if tool execution is needed
         """
-
-        # Lazy init, initialize the browser and the page on the first generate reply only
-        if not self.did_lazy_init:
-            await self.lazy_init()
-
         try:
             assert self._page is not None
+            await self._playwright_controller._ensure_page_ready(self._page)  # type: ignore
             assert (
                 await self._playwright_controller.get_interactive_rects(self._page)
                 is not None
@@ -987,7 +1048,7 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
 
         # Ask the page for interactive elements, then prepare the state-of-mark screenshot
         rects = await self._playwright_controller.get_interactive_rects(self._page)
-        viewport = await self._playwright_controller.get_visual_viewport(self._page)
+        # viewport = await self._playwright_controller.get_visual_viewport(self._page)
         screenshot = await self._playwright_controller.get_screenshot(self._page)
         som_screenshot, visible_rects, rects_above, rects_below, element_id_mapping = (
             add_set_of_mark(screenshot, rects, use_sequential_ids=True)
@@ -1028,15 +1089,15 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
         # If there are multiple tabs, we can switch between them and close them
         if not self.single_tab_mode and num_tabs > 1:
             tools.append(TOOL_SWITCH_TAB)
-            tools.append(TOOL_CLOSE_TAB)
+            # tools.append(TOOL_CLOSE_TAB)
 
         # We can scroll up
-        if viewport["pageTop"] > 5:
-            tools.append(TOOL_PAGE_UP)
+        # if viewport["pageTop"] > 5:
+        #    tools.append(TOOL_PAGE_UP)
 
         # Can scroll down
-        if (viewport["pageTop"] + viewport["height"] + 5) < viewport["scrollHeight"]:
-            tools.append(TOOL_PAGE_DOWN)
+        # if (viewport["pageTop"] + viewport["height"] + 5) < viewport["scrollHeight"]:
+        #    tools.append(TOOL_PAGE_DOWN)
 
         # Add select_option tool only if there are option elements
         if any(rect.get("role") == "option" for rect in rects.values()):
@@ -1299,7 +1360,8 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
             ) = await self._playwright_controller.visit_page(self._page, url)
         # If the argument contains a space, treat it as a search query
         elif " " in url:
-            ret, approved = await self._check_url_and_generate_msg("bing.com")
+            search_url, domain = self._get_search_url(url)
+            ret, approved = await self._check_url_and_generate_msg(domain)
             if not approved:
                 return ret
             (
@@ -1307,7 +1369,7 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
                 reset_last_download,
             ) = await self._playwright_controller.visit_page(
                 self._page,
-                f"https://www.bing.com/search?q={quote_plus(url)}&FORM=QBLH",
+                search_url,
             )
         # Otherwise, prefix with https://
         else:
@@ -1339,17 +1401,18 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
 
     async def _execute_tool_web_search(self, args: Dict[str, Any]) -> str:
         assert self._page is not None
-        ret, approved = await self._check_url_and_generate_msg("bing.com")
+        query = cast(str, args.get("query"))
+        search_url, domain = self._get_search_url(query)
+        ret, approved = await self._check_url_and_generate_msg(domain)
         if not approved:
             return ret
-        query = cast(str, args.get("query"))
         action_description = f"I typed '{query}' into the browser search bar."
         (
             reset_prior_metadata,
             reset_last_download,
         ) = await self._playwright_controller.visit_page(
             self._page,
-            f"https://www.bing.com/search?q={quote_plus(query)}&FORM=QBLH",
+            search_url,
         )
         if reset_last_download:
             self._last_download = None
@@ -1366,6 +1429,18 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
         assert self._page is not None
         await self._playwright_controller.page_down(self._page)
         return "I scrolled down one page in the browser."
+
+    async def _execute_tool_scroll_down(self, args: Dict[str, Any]) -> str:
+        assert self._page is not None
+        pixels = int(args.get("pixels", 400))
+        await self._playwright_controller.scroll_mousewheel(self._page, "down", pixels)
+        return f"I scrolled down {pixels} pixels in the browser."
+
+    async def _execute_tool_scroll_up(self, args: Dict[str, Any]) -> str:
+        assert self._page is not None
+        pixels = int(args.get("pixels", 400))
+        await self._playwright_controller.scroll_mousewheel(self._page, "up", pixels)
+        return f"I scrolled up {pixels} pixels in the browser."
 
     async def _execute_tool_click(
         self,
@@ -1389,6 +1464,8 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
         if new_page_tentative is not None:
             new_url = new_page_tentative.url
             self._page = new_page_tentative
+            # Ensure the new page is visible and active
+            await self._page.bring_to_front()
             self._prior_metadata_hash = None
             ret, approved = await self._check_url_and_generate_msg(new_url)
             if not approved:
@@ -1423,6 +1500,8 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
         if new_page_tentative is not None:
             new_url = new_page_tentative.url
             self._page = new_page_tentative
+            # Ensure the new page is visible and active
+            await self._page.bring_to_front()
             self._prior_metadata_hash = None
             ret, approved = await self._check_url_and_generate_msg(new_url)
             if not approved:
@@ -1438,14 +1517,13 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
     ) -> str:
         assert "input_field_id" in args
         assert "text_value" in args
-        assert "press_enter" in args
         assert "delete_existing_text" in args
         input_field_id: str = str(args["input_field_id"])
         input_field_name = self._target_name(input_field_id, rects)
         input_field_id = element_id_mapping[input_field_id]
 
         text_value = str(args.get("text_value"))
-        press_enter = bool(args.get("press_enter"))
+        press_enter = bool(args.get("press_enter", True))
         delete_existing_text = bool(args.get("delete_existing_text"))
 
         action_description = (
@@ -1532,6 +1610,8 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
             if not approved:
                 return ret
             self._page = new_page_tentative
+            # Ensure the new page is visible and active
+            await self._page.bring_to_front()
             self._prior_metadata_hash = None
 
         return action_description
@@ -1545,6 +1625,8 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
         action_description = f"I created a new tab and navigated to '{url}'."
         new_page = await self._playwright_controller.create_new_tab(self._context, url)
         self._page = new_page
+        # Ensure the new page is visible and active
+        await self._page.bring_to_front()
         self._prior_metadata_hash = None
         return action_description
 
@@ -1557,6 +1639,8 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
                 self._context, tab_index
             )
             self._page = new_page
+            # Ensure the switched tab is visible and active
+            await self._page.bring_to_front()
             self._prior_metadata_hash = None
             return f"I switched to tab {tab_index}."
         except (ValueError, TypeError) as e:
@@ -1571,6 +1655,8 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
                 self._context, tab_index
             )
             self._page = new_page
+            # Ensure the new active tab is visible and active
+            await self._page.bring_to_front()
             self._prior_metadata_hash = None
             return f"I closed tab {tab_index} and switched to an adjacent tab."
         except (ValueError, TypeError) as e:
@@ -1972,6 +2058,7 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
             viewport_height=self.viewport_height,
             viewport_width=self.viewport_width,
             use_action_guard=self.use_action_guard,
+            search_engine=self.search_engine,
         )
 
     @classmethod
@@ -1996,21 +2083,35 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
             viewport_height=config.viewport_height,
             viewport_width=config.viewport_width,
             use_action_guard=config.use_action_guard,
+            search_engine=config.search_engine,
         )
 
     @classmethod
     def from_config(cls, config: WebSurferConfig) -> Self:
         return cls._from_config(config)
 
-    async def save_state(self) -> Mapping[str, Any]:
+    async def save_state(self, save_browser: bool = True) -> Mapping[str, Any]:
         """Save the current state of the WebSurfer.
+        Args:
+            save_browser (bool): Whether to save the browser state. Defaults to True.
 
         Returns:
             A dictionary containing the chat history and browser state
         """
+
+        if not self.did_lazy_init:
+            state = WebSurferState(
+                chat_history=self._chat_history,
+                browser_state=None,  # No browser state when not initialized
+            )
+            return state.model_dump()
+
         assert self._context is not None
-        # Get the browser state and convert it to a dict
-        browser_state = await save_browser_state(self._context, self._page)
+
+        browser_state = None
+        if save_browser:
+            # Get the browser state and convert it to a dict
+            browser_state = await save_browser_state(self._context, self._page)
 
         # Create and return the WebSurfer state
         state = WebSurferState(
@@ -2019,8 +2120,11 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
         )
         return state.model_dump()
 
-    async def load_state(self, state: Mapping[str, Any]) -> None:
-        """Load a previously saved state.
+    async def load_state(
+        self, state: Mapping[str, Any], load_browser: bool = True
+    ) -> None:
+        """
+        Load a previously saved state.
 
         Args:
             state: Dictionary containing the state to load
@@ -2031,8 +2135,9 @@ class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
         # Update the chat history
         self._chat_history = web_surfer_state.chat_history
 
-        # Load the browser state if it exists
-        if web_surfer_state.browser_state is not None:
+        # Load the browser state if it exists and load_browser is True
+        if load_browser and web_surfer_state.browser_state is not None:
+            await self.lazy_init()
             assert self._context is not None
             await load_browser_state(self._context, web_surfer_state.browser_state)
 
